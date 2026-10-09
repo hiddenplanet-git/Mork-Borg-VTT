@@ -8,11 +8,54 @@ import os
 import random
 import re
 import secrets
+import threading
+import time
 import unicodedata
 import uuid
 import zipfile
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# One lock for all game state (posts, characters, scene, notes, and the files
+# they're saved to). Waitress serves requests on several threads at once;
+# without this, two requests changing state together can lose one change, and
+# a request reading the characters while another adds one can crash with
+# "dictionary changed size during iteration".
+#
+# Rather than remembering to lock in every route, each request holds the
+# lock for its whole run (see StateLockMiddleware). Requests here take
+# milliseconds, so a table's worth of players never notices the queueing.
+# It's re-entrant, so the save functions also take it — that keeps them safe
+# when called outside a request too, such as at startup.
+# ---------------------------------------------------------------------------
+state_lock = threading.RLock()
+
+
+class StateLockMiddleware:
+    """Run each request with state_lock held. Flask finishes the whole
+    request — handler, template rendering, teardown — before returning here,
+    so everything that touches state happens inside the lock. Only the
+    streaming of an already-built response (e.g. a file download) runs after
+    it's released, and that reads no game state."""
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    # Routes that take the lock themselves. The backup import receives a
+    # file upload of several megabytes; holding the lock while a slow
+    # connection trickles that in would freeze the board for everyone, so it
+    # reads the upload first and locks only to swap the game in.
+    SELF_LOCKING_PATHS = ('/dm/import-backup',)
+
+    def __call__(self, environ, start_response):
+        if environ.get('PATH_INFO') in self.SELF_LOCKING_PATHS:
+            return self.wsgi_app(environ, start_response)
+        with state_lock:
+            return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = StateLockMiddleware(app.wsgi_app)
 
 # Both of these can be supplied by the environment, which is how the Docker
 # setup passes them in. Editing the fallbacks here still works for a plain
@@ -22,6 +65,16 @@ app.secret_key = os.environ.get('MORKBORG_SECRET_KEY') or 'dev-secret-key-change
 # Reject any request body over 64KB outright
 app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=365)
+
+# Set MORKBORG_BEHIND_PROXY=1 when the app sits behind a reverse proxy
+# (Caddy, nginx). Otherwise every request appears to come from the proxy's
+# address and the per-IP login limits would lump all players together.
+if os.environ.get('MORKBORG_BEHIND_PROXY') == '1':
+    # Trust exactly one proxy's X-Forwarded-For / -Proto so request.remote_addr
+    # is the player's real address. Only enable this when there IS a proxy in
+    # front — otherwise anyone could fake their address with the header.
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 
 MAX_MESSAGE_LENGTH = 300
 
@@ -53,10 +106,34 @@ PASSWORD_ALPHABET = 'abcdefghjkmnpqrstuvwxyzACDEFGHJKLMNPQRTUVWXY346789'
 PASSWORD_LENGTH = 10
 MAX_LOGIN_FIELD_LENGTH = 64
 
-# Failed player logins allowed per IP inside the window before further
-# attempts are refused until the window rolls forward.
-LOGIN_MAX_FAILURES = 10
-LOGIN_FAILURE_WINDOW = timedelta(minutes=10)
+# Rate limits, as (how many, per how many seconds), counted over a rolling
+# window and kept in memory (a restart clears them). Change them here.
+#
+# Logins only count FAILED attempts, so a player who types their password
+# right is never slowed down. The per-username limit stops someone guessing
+# one character's password from many machines; the DM's global limit does the
+# same for the single shared DM password — note that a determined stranger
+# could use it to lock the real DM out for an hour, which is the price of
+# protecting that password.
+PLAYER_LOGIN_FAILS_PER_IP = (10, 10 * 60)
+PLAYER_LOGIN_FAILS_PER_USERNAME = (5, 15 * 60)
+DM_LOGIN_FAILS_PER_IP = (5, 15 * 60)
+DM_LOGIN_FAILS_TOTAL = (20, 60 * 60)
+
+# Players: one post (including a whisper to the DM) per minute. Edits and
+# deletions of their own posts have their own, looser limit so fixing a typo
+# right after posting still works. Rolls are capped so a post's worth of
+# dice is fine but rolling over and over to fish for a good result isn't.
+PLAYER_POSTS = (1, 60)
+PLAYER_POST_EDITS = (5, 60)
+PLAYER_ROLLS = (6, 60)
+# The DM isn't limited on posting, but dice still have a generous cap.
+DM_ROLLS = (60, 60)
+
+# Rolls made by the server and waiting to be attached to a post. A post can
+# only use rolls from here, once each, so dice can't be made up in the
+# browser. Unused rolls expire.
+ROLL_TTL_SECONDS = 30 * 60
 
 # A palette tuned for the near-black MÖRK BORG page background: every entry is
 # light/saturated enough to stay legible on --ink. Assigned to characters on
@@ -608,6 +685,14 @@ REV_SECTIONS = ('vitals', 'abilities', 'kit', 'inventory', 'conditions')
 # carrying capacity) uses base + the sum of active conditions, and removing a
 # condition simply drops its modifiers again.
 MAX_CONDITIONS = 6
+
+# Backup import. The upload limit is separate from the 64KB cap on every
+# other request; the uncompressed limit stops a tiny zip that inflates to
+# gigabytes. Before an import replaces anything, the current game is saved
+# to backups/ next to the other state files, keeping the newest few.
+IMPORT_MAX_UPLOAD = 25 * 1024 * 1024
+IMPORT_MAX_UNCOMPRESSED = 100 * 1024 * 1024
+KEEP_AUTO_BACKUPS = 20
 MAX_CONDITION_NAME = 30
 MAX_CONDITION_MOD = 3
 # One extra slot on your person for something nearly weightless (a ring, a
@@ -645,6 +730,16 @@ def condition_summary(condition):
 def public_conditions(character):
     return [{'id': c['id'], 'name': c['name'], 'summary': condition_summary(c)}
             for c in character.get('conditions', [])]
+
+
+def person_slots_shown(character):
+    """How many 'on your person' slots a player sees: their carrying
+    capacity, or more if they already hold items past it (so nothing is ever
+    hidden from them, and the sheet shows those slots as overloaded)."""
+    capacity = carrying_capacity(effective_ability(character, 'strength'))
+    inventory = character.get('inventory', [])
+    last = max((i for i, item in enumerate(inventory) if item.strip()), default=-1)
+    return max(0, min(INVENTORY_SLOTS, max(capacity, last + 1)))
 
 
 def bump(character, *sections):
@@ -880,14 +975,59 @@ def log_activity(actor, action, details=''):
     activity_logger.info(msg)
 
 
+def write_json_atomic(path, data):
+    """Write JSON so the file on disk is always either the old version or
+    the new one, never half of each: write a temp file in the same directory,
+    flush it to disk, then swap it into place with os.replace() (atomic on
+    the same filesystem). A crash mid-write leaves only a stray temp file,
+    which is cleaned up on the next start."""
+    tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+    with state_lock:
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        # Make the rename itself durable (POSIX; harmless to skip elsewhere).
+        try:
+            dir_fd = os.open(os.path.dirname(path) or '.', os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, AttributeError):
+            pass
+
+
+def refuse_to_start_with_damaged_file(path, exc):
+    """A state file that exists but can't be read must not be treated as
+    empty: the next save would overwrite it and the game would be gone for
+    good. Stop instead, so it can be restored."""
+    raise SystemExit(
+        f'\nCannot read {path}\n  {exc}\n\n'
+        'The app has NOT started, so nothing has been overwritten.\n'
+        'Restore this file from a backup (the DM dashboard\'s "Download backup"\n'
+        'zip, or a copy you made), or move it aside to start that part fresh.\n'
+    )
+
+
 def load_json_file(path):
+    """{} if the file doesn't exist yet; stops the app if it exists but is
+    damaged (see refuse_to_start_with_damaged_file)."""
     if not os.path.exists(path):
         return {}
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        refuse_to_start_with_damaged_file(path, exc)
 
 
 def load_scene_name():
@@ -897,8 +1037,7 @@ def load_scene_name():
 
 
 def save_scene_name(name):
-    with open(SCENE_FILE, 'w', encoding='utf-8') as f:
-        json.dump({'scene_name': name}, f, indent=2)
+    write_json_atomic(SCENE_FILE, {'scene_name': name})
 
 
 def load_dm_notes():
@@ -908,8 +1047,7 @@ def load_dm_notes():
 
 
 def save_dm_notes(notes):
-    with open(DM_NOTES_FILE, 'w', encoding='utf-8') as f:
-        json.dump({'notes': notes}, f, indent=2)
+    write_json_atomic(DM_NOTES_FILE, {'notes': notes})
 
 
 def clean_notes(value):
@@ -928,8 +1066,10 @@ def load_posts():
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return []
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        refuse_to_start_with_damaged_file(DATA_FILE, exc)
+    if not isinstance(data, list):
+        refuse_to_start_with_damaged_file(DATA_FILE, 'expected a list of posts')
 
     # Same defensive defaults as load_character_store: this file is plain JSON
     # next to the script, and a hand-edited post missing a field shouldn't be
@@ -950,13 +1090,12 @@ def load_posts():
 
 
 def save_posts():
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(posts, f, indent=2)
+    write_json_atomic(DATA_FILE, posts)
 
 
 def save_characters():
-    with open(CHAR_FILE, 'w', encoding='utf-8') as f:
-        json.dump({'characters': characters, 'client_map': client_map}, f, indent=2)
+    write_json_atomic(CHAR_FILE, {'characters': characters, 'client_map': client_map,
+                                  'epoch': state_epoch})
 
 
 def generate_username(taken):
@@ -1110,14 +1249,35 @@ def load_character_store():
 
     if changed:
         # Write the filled-in defaults back so this only has to happen once
-        with open(CHAR_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'characters': chars, 'client_map': cmap}, f, indent=2)
+        store = {'characters': chars, 'client_map': cmap}
+        if isinstance(raw, dict) and raw.get('epoch'):
+            store['epoch'] = raw['epoch']
+        write_json_atomic(CHAR_FILE, store)
 
     return chars, cmap
 
 
+# Temp files left by a crash in the middle of write_json_atomic(). The real
+# file next to each is intact (the swap never happened), so these are safe
+# to throw away.
+for _name in os.listdir(DATA_DIR):
+    if _name.endswith('.tmp') and any(
+            _name.startswith(os.path.basename(f) + '.')
+            for f in (DATA_FILE, CHAR_FILE, SCENE_FILE, DM_NOTES_FILE)):
+        try:
+            os.remove(os.path.join(DATA_DIR, _name))
+            print(f'[morkborg] removed leftover temp file {_name}')
+        except OSError:
+            pass
+
 posts = load_posts()
 characters, client_map = load_character_store()  # see load_character_store() docstring
+# Changes only when a backup is imported. Every open page was built from one
+# epoch; when the feed poll reports a different one, the page reloads itself
+# so nobody keeps looking at (or saving into) the game that was replaced.
+_raw_store = load_json_file(CHAR_FILE)
+state_epoch = (_raw_store.get('epoch') if isinstance(_raw_store, dict) else None) or 'initial'
+del _raw_store
 scene_name = load_scene_name()
 dm_notes = load_dm_notes()
 _next_post_seq = (max((p.get('seq', -1) for p in posts), default=-1)) + 1
@@ -1233,18 +1393,162 @@ def find_character_by_username(username):
     return None
 
 
-# ip -> list of datetimes of recent failed player logins (in memory only)
-_login_failures = {}
+class RateLimiter:
+    """Rolling-window counter: at most `limit` events per `window` seconds for
+    each key. Thread-safe, since the server handles requests concurrently."""
+
+    def __init__(self, name, limit_window):
+        self.name = name
+        self.limit, self.window = limit_window
+        self._events = {}
+        self._lock = threading.Lock()
+
+    def _recent(self, key, now):
+        events = [t for t in self._events.get(key, []) if t > now - self.window]
+        if events:
+            self._events[key] = events
+        else:
+            self._events.pop(key, None)
+        return events
+
+    def wait(self, key):
+        """Seconds until `key` may act again; 0 if it may act now."""
+        now = time.monotonic()
+        with self._lock:
+            events = self._recent(key, now)
+            if len(events) < self.limit:
+                return 0
+            return max(1, int(events[-self.limit] + self.window - now + 0.999))
+
+    def record(self, key):
+        now = time.monotonic()
+        with self._lock:
+            self._events.setdefault(key, []).append(now)
+            if len(self._events) > 5000:  # keep memory bounded under abuse
+                for k in list(self._events):
+                    self._recent(k, now)
+
+    def take(self, key):
+        """Record an event if allowed. Returns 0 on success, or the wait."""
+        now = time.monotonic()
+        with self._lock:
+            events = self._recent(key, now)
+            if len(events) >= self.limit:
+                return max(1, int(events[-self.limit] + self.window - now + 0.999))
+            self._events.setdefault(key, []).append(now)
+            return 0
+
+    def reset(self, key):
+        with self._lock:
+            self._events.pop(key, None)
 
 
-def login_throttled(ip):
-    cutoff = datetime.now() - LOGIN_FAILURE_WINDOW
-    recent = [t for t in _login_failures.get(ip, []) if t > cutoff]
-    if recent:
-        _login_failures[ip] = recent
-    else:
-        _login_failures.pop(ip, None)
-    return len(recent) >= LOGIN_MAX_FAILURES
+player_login_ip_limiter = RateLimiter('player login (ip)', PLAYER_LOGIN_FAILS_PER_IP)
+player_login_user_limiter = RateLimiter('player login (username)', PLAYER_LOGIN_FAILS_PER_USERNAME)
+dm_login_ip_limiter = RateLimiter('DM login (ip)', DM_LOGIN_FAILS_PER_IP)
+dm_login_total_limiter = RateLimiter('DM login (all)', DM_LOGIN_FAILS_TOTAL)
+post_limiter = RateLimiter('posts', PLAYER_POSTS)
+post_edit_limiter = RateLimiter('post edits', PLAYER_POST_EDITS)
+player_roll_limiter = RateLimiter('player rolls', PLAYER_ROLLS)
+dm_roll_limiter = RateLimiter('DM rolls', DM_ROLLS)
+
+
+def client_ip():
+    return request.remote_addr or 'unknown'
+
+
+def wait_text(seconds):
+    return f'{seconds} second{"s" if seconds != 1 else ""}' if seconds < 120 else f'{(seconds + 59) // 60} minutes'
+
+
+def too_many(what, who, seconds):
+    log_activity(who, 'RATE_LIMITED', f'{what}, ip={client_ip()}, retry in {seconds}s')
+
+
+# ---------------------------------------------------------------------------
+# Server-held dice. /roll stores every roll it makes under its owner ('dm' or
+# a character id) and hands back an id; a post names the ids it wants and the
+# server uses its own stored dice. Each roll can be used once, by its owner.
+# ---------------------------------------------------------------------------
+_pending_rolls = {}  # owner -> {roll_id: roll}
+_pending_lock = threading.Lock()
+
+
+def _expire_rolls(now):
+    """Drop rolls nobody posted in time, logging them so the DM can see
+    rolls that were made and quietly abandoned."""
+    for owner in list(_pending_rolls):
+        for roll_id, roll in list(_pending_rolls[owner].items()):
+            if now - roll['created'] > ROLL_TTL_SECONDS:
+                del _pending_rolls[owner][roll_id]
+                log_activity(roll['who'], 'ROLL_UNUSED', f'{roll["description"]} = {roll["total"]} (expired, never posted)')
+        if not _pending_rolls[owner]:
+            del _pending_rolls[owner]
+
+
+def store_roll(owner, who, results, total, description):
+    roll_id = secrets.token_hex(8)
+    now = time.monotonic()
+    with _pending_lock:
+        _expire_rolls(now)
+        bucket = _pending_rolls.setdefault(owner, {})
+        bucket[roll_id] = {'results': results, 'total': total, 'description': description,
+                           'created': now, 'who': who}
+        # More waiting than fit in a post means some were abandoned.
+        while len(bucket) > MAX_ROLLS_PER_POST:
+            oldest = min(bucket, key=lambda k: bucket[k]['created'])
+            dropped = bucket.pop(oldest)
+            log_activity(who, 'ROLL_UNUSED', f'{dropped["description"]} = {dropped["total"]} (replaced, never posted)')
+    return roll_id
+
+
+def save_post_draft(message, rolls_raw, to_dm, owner):
+    """Remember a refused post in the session so the board can put it back.
+    Only roll ids still waiting for this owner are kept."""
+    try:
+        submitted = json.loads(rolls_raw)
+    except (json.JSONDecodeError, TypeError):
+        submitted = []
+    rolls = []
+    for roll in submitted if isinstance(submitted, list) else []:
+        if isinstance(roll, dict) and isinstance(roll.get('roll_id'), str) and peek_roll(owner, roll['roll_id']):
+            label = roll.get('label')
+            rolls.append({'roll_id': roll['roll_id'],
+                          'label': clean_text(label if isinstance(label, str) else '', MAX_ROLL_LABEL_LENGTH),
+                          'ability': roll.get('ability') if roll.get('ability') in ABILITY_KEYS else None})
+    session['post_draft'] = {'message': message[:MAX_MESSAGE_LENGTH], 'to_dm': bool(to_dm),
+                             'rolls': rolls[:MAX_ROLLS_PER_POST]}
+
+
+def take_post_draft(owner):
+    """The refused post to restore, with each roll's dice filled back in
+    from the server's record (rolls that have since expired are dropped)."""
+    draft = session.pop('post_draft', None)
+    if not isinstance(draft, dict):
+        return None
+    rolls = []
+    for roll in draft.get('rolls', []):
+        stored = peek_roll(owner, roll.get('roll_id', ''))
+        if stored:
+            rolls.append({**roll, 'results': stored['results'], 'total': stored['total'],
+                          'description': stored['description']})
+    return {'message': draft.get('message', ''), 'to_dm': bool(draft.get('to_dm')), 'rolls': rolls}
+
+
+def peek_roll(owner, roll_id):
+    with _pending_lock:
+        _expire_rolls(time.monotonic())
+        return _pending_rolls.get(owner, {}).get(roll_id)
+
+
+def take_roll(owner, roll_id):
+    with _pending_lock:
+        _expire_rolls(time.monotonic())
+        bucket = _pending_rolls.get(owner, {})
+        roll = bucket.pop(roll_id, None)
+        if not bucket:
+            _pending_rolls.pop(owner, None)
+        return roll
 
 
 def clean_text(value, max_len):
@@ -1672,76 +1976,66 @@ def format_message(message):
 app.jinja_env.filters['format_message'] = format_message
 
 
-def parse_submitted_rolls(rolls_raw, character=None, allow_modifier=False):
-    """Validate/clean a client-submitted 'rolls' JSON payload (used by both
-    player posts and DM posts, since both use the same dice-roller widget).
-    Every die value is re-checked against DICE_TYPES bounds server-side —
-    the client's totals are never trusted as-is.
+def parse_submitted_rolls(rolls_raw, owner, character=None, allow_modifier=False, consume=True):
+    """Turn a post's 'rolls' payload into the rolls to publish.
+
+    The browser only says WHICH rolls to attach (by the roll_id /roll handed
+    out), plus a label and, for players, an ability; the dice themselves come
+    from the server's own record of the roll. A roll id that isn't waiting
+    for this `owner` — made up, someone else's, expired or already posted — is
+    left off. With consume=True each roll used is removed, so it can only be
+    posted once. Returns (clean_rolls, dropped_count).
 
     When a player's roll names an ability ('agility', 'presence', ...), that
     ability's modifier is read from `character` here and added to the total,
-    so the stat applied is always the one on file, not whatever the browser
-    sent. DM rolls pass no character, so any ability field is ignored.
+    so the stat applied is always the one on file (conditions included).
 
     DM rolls pass allow_modifier=True instead, which accepts a whole-number
     'modifier' (within +/-MAX_ROLL_MODIFIER) on each roll. A modifier of 0
     adds nothing to the description, so unmodified rolls read as before."""
-    clean_rolls = []
     try:
         submitted_rolls = json.loads(rolls_raw)
     except (json.JSONDecodeError, TypeError):
         submitted_rolls = []
-
     if not isinstance(submitted_rolls, list):
-        return clean_rolls
+        return [], 0
 
+    clean_rolls, dropped, seen = [], 0, set()
     for roll in submitted_rolls[:MAX_ROLLS_PER_POST]:
         if not isinstance(roll, dict):
             continue
-        results = roll.get('results')
-        label = roll.get('label')
-        if not isinstance(results, dict) or not isinstance(label, str):
+        roll_id = roll.get('roll_id')
+        if not isinstance(roll_id, str) or roll_id in seen:
+            dropped += 1
+            continue
+        seen.add(roll_id)
+        stored = take_roll(owner, roll_id) if consume else peek_roll(owner, roll_id)
+        if not stored:
+            dropped += 1
             continue
 
-        total = 0
-        description_parts = []
-        valid = True
-        for die, values in results.items():
-            if die not in DICE_TYPES or not isinstance(values, list):
-                valid = False
-                break
-            sides = DICE_TYPES[die]
-            cleaned_values = []
-            for v in values:
-                if not isinstance(v, int) or not (1 <= v <= sides):
-                    valid = False
-                    break
-                cleaned_values.append(v)
-            if not valid:
-                break
-            total += sum(cleaned_values)
-            description_parts.append(f'{len(cleaned_values)}{die} {cleaned_values}')
+        label = roll.get('label')
+        clean_label = clean_text(label if isinstance(label, str) else '', MAX_ROLL_LABEL_LENGTH) or 'Roll'
+        total = stored['total']
+        description = stored['description']
+        ability = roll.get('ability')
+        if character and ability in ABILITY_KEYS:
+            modifier = effective_ability(character, ability)
+            total += modifier
+            description += f' + {ABILITIES[ABILITY_KEYS.index(ability)]} ({signed(modifier)})'
+        manual = roll.get('modifier', 0)
+        if (allow_modifier and isinstance(manual, int) and not isinstance(manual, bool)
+                and manual != 0 and abs(manual) <= MAX_ROLL_MODIFIER):
+            total += manual
+            description += f' + {manual}' if manual > 0 else f' - {-manual}'
+        clean_rolls.append({'label': clean_label, 'description': description, 'total': total})
 
-        if valid and description_parts:
-            clean_label = clean_text(label, MAX_ROLL_LABEL_LENGTH) or 'Roll'
-            description = ' + '.join(description_parts)
-            ability = roll.get('ability')
-            if character and ability in ABILITY_KEYS:
-                modifier = effective_ability(character, ability)
-                total += modifier
-                description += f' + {ABILITIES[ABILITY_KEYS.index(ability)]} ({signed(modifier)})'
-            manual = roll.get('modifier', 0)
-            if (allow_modifier and isinstance(manual, int) and not isinstance(manual, bool)
-                    and manual != 0 and abs(manual) <= MAX_ROLL_MODIFIER):
-                total += manual
-                description += f' + {manual}' if manual > 0 else f' - {-manual}'
-            clean_rolls.append({
-                'label': clean_label,
-                'description': description,
-                'total': total
-            })
+    return clean_rolls, dropped
 
-    return clean_rolls
+
+def dropped_rolls_message(dropped):
+    return (f'{dropped} roll{" was" if dropped == 1 else "s were"} left off: '
+            'expired, already posted, or not rolled here. Roll again if you need it.')
 
 
 # ---------------------------------------------------------------------------
@@ -1768,19 +2062,32 @@ POPOUT_SCRIPT = """
 
 TOP_BAR = """
 <div class="topbar">
-    <a class="topbar-btn" href="{{ url_for('dm_home') }}">&#9760; DM</a>
+    <div class="topbar-left">
+        {% if notes_for != 'dm' %}
+            <a class="topbar-btn" href="{{ url_for('dm_home') }}"><span class="btn-icon">&#9760; </span>DM</a>
+        {% endif %}
+        {% if notes_for == 'player' %}
+            <form method="POST" action="{{ url_for('player_logout') }}" class="topbar-form">
+                <button type="submit" class="topbar-btn">Log Out</button>
+            </form>
+        {% elif notes_for == 'dm' %}
+            <form method="POST" action="{{ url_for('dm_logout') }}" class="topbar-form">
+                <button type="submit" class="topbar-btn">Log Out</button>
+            </form>
+        {% endif %}
+    </div>
     <h1>{{ scene_name }}</h1>
     <div class="topbar-right">
         {% if notes_for == 'dm' %}
             <a class="topbar-btn" href="{{ url_for('dm_players') }}" target="_blank" rel="noopener noreferrer"
-               onclick="return popout(this.href, 'morkborg_players', 860, 1000);">&#9760; Players</a>
+               onclick="return popout(this.href, 'morkborg_players', 860, 1000);"><span class="btn-icon">&#9760; </span>Players</a>
         {% endif %}
         {% if notes_for %}
             <a class="topbar-btn" href="{{ url_for('notes', who=notes_for) }}" target="_blank" rel="noopener noreferrer"
-               onclick="return popout(this.href, 'morkborg_notes_{{ notes_for }}', 520, 640);">&#9998; Notes</a>
+               onclick="return popout(this.href, 'morkborg_notes_{{ notes_for }}', 520, 640);"><span class="btn-icon">&#9998; </span>Notes</a>
         {% endif %}
         <a class="topbar-btn acid" href="{{ url_for('rules') }}" target="_blank" rel="noopener noreferrer"
-           onclick="return popout(this.href, 'morkborg_rules', 980, 1000);">&#9670; Rules</a>
+           onclick="return popout(this.href, 'morkborg_rules', 980, 1000);"><span class="btn-icon">&#9670; </span>Rules</a>
     </div>
 </div>
 """
@@ -1868,13 +2175,31 @@ SHARED_CSS = """
         box-shadow: 4px 4px 0 var(--blood);
         flex: 0 0 auto;
     }
-    .topbar-right { display: flex; gap: 10px; flex: 0 0 auto; }
+    .topbar-right, .topbar-left { display: flex; gap: 10px; flex: 0 0 auto; flex-wrap: wrap; }
+    .topbar-form { display: inline; margin: 0; padding: 0; background: none; border: none; }
+    button.topbar-btn { margin: 0; cursor: pointer; font-family: var(--body); line-height: normal; }
+    button.topbar-btn:active { transform: none; }
     @media (max-width: 600px) {
-        /* Title on its own line, buttons share the row below. */
-        .topbar { flex-wrap: wrap; }
+        /* Title on its own line; all the buttons share one row below it.
+           Icons drop and the buttons slim down so four fit on a small phone. */
+        .topbar { flex-wrap: wrap; row-gap: 10px; column-gap: 6px; padding-top: 12px; }
         .topbar h1 { order: -1; flex: 1 0 100%; text-align: center; }
-        .topbar-right { gap: 6px; }
-        .topbar-btn { padding-left: 10px; padding-right: 10px; }
+        .topbar-left, .topbar-right { flex-wrap: nowrap; gap: 6px; }
+        .topbar-right { margin-left: auto; }
+        body { padding-left: 12px; padding-right: 12px; }
+        .topbar { align-items: center; }
+        .topbar-left, .topbar-right { align-items: center; }
+        .topbar-btn {
+            padding: 7px 8px; font-size: .72em; letter-spacing: .05em; line-height: 1.2;
+            box-shadow: 3px 3px 0 var(--blood);
+        }
+        .topbar-btn.acid { box-shadow: 3px 3px 0 var(--rot); }
+        .btn-icon { display: none; }
+    }
+    @media (max-width: 360px) {
+        .topbar { column-gap: 4px; }
+        .topbar-left, .topbar-right { gap: 4px; }
+        .topbar-btn { padding: 6px 6px; letter-spacing: .02em; }
     }
     .topbar-btn.acid { background: var(--acid); box-shadow: 4px 4px 0 var(--rot); }
     .topbar-btn:hover { background: var(--rot); color: var(--ink); box-shadow: 4px 4px 0 var(--acid); }
@@ -2032,6 +2357,9 @@ SHARED_CSS = """
         gap: 7px;
         margin-top: 10px;
     }
+    .inv-slot[hidden] { display: none; }
+    .inv-slot.over-slot input { border-color: var(--rot); }
+    .inv-slot.over-slot label { color: var(--rot); }
     .inv-slot label { display: block; font-size: .7em; color: var(--ash); margin-bottom: 2px; letter-spacing: .1em; }
     .inv-slot input { margin-bottom: 0; }
     .inv-status { font-size: .85em; color: var(--acid); margin-top: 8px; min-height: 1.2em; letter-spacing: .08em; }
@@ -2232,6 +2560,19 @@ SHARED_CSS = """
     /* --- pop-out button shelf (DM tools) --- */
     .shelf { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 6px; }
     .docs-card { padding-top: 12px; padding-bottom: 12px; }
+    .scene-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .import-form { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--edge); }
+    .import-label { display: block; font-size: .8em; font-weight: 900; letter-spacing: .1em;
+                    text-transform: uppercase; color: var(--ash); margin-bottom: 8px; }
+    .import-label input[type=file] { display: block; margin-top: 6px; color: var(--bone);
+                                      font-family: var(--body); text-transform: none; letter-spacing: 0; }
+    .scene-actions button { margin: 0; }
+    .btn-link {
+        display: inline-block; padding: 9px 18px; border: 2px solid var(--ink); background: var(--bone);
+        color: var(--ink); text-decoration: none; font-weight: 900; font-size: 1em; letter-spacing: .12em;
+        text-transform: uppercase; box-shadow: 4px 4px 0 var(--ash);
+    }
+    .btn-link:hover { background: var(--acid); color: var(--ink); }
     .docs-card h3 { margin: 0 0 6px; }
     .docs-card .shelf { gap: 6px; margin-top: 0; }
     .docs-card .shelf-btn { padding: 4px 10px; font-size: .78em; box-shadow: none; }
@@ -2286,7 +2627,7 @@ SHARED_CSS = """
     }
     @media (max-width: 850px) {
         .layout { flex-direction: column; }
-        .layout-left { max-width: none; width: 100%; }
+        .layout-left { max-width: none; width: 100%; min-width: 0; }
         .layout-right { position: static; width: 100%; }
         .feed-scroll { max-height: 70vh; }
         .topbar h1 { font-size: 1.5em; }
@@ -2755,6 +3096,33 @@ BOARD_TEMPLATE = """
     <div class="layout">
     <div class="layout-left">
 
+    <form method="POST" action="{{ url_for('new_post') }}" id="postForm">
+        <div class="hint" style="margin-bottom:10px;">Posting as <strong style="color: {{ character.color }};">{{ character.name }}</strong></div>
+        <textarea name="message" placeholder="Speak, wretch..." maxlength="{{ max_len }}" required>{{ draft.message if draft else '' }}</textarea>
+        <div class="char-count">Max {{ max_len }} characters &nbsp;&bull;&nbsp; *bold* &nbsp;&bull;&nbsp; "italic dialogue" &nbsp;&bull;&nbsp; type @ to pick a character</div>
+
+        <div class="dice-roller">
+            <h3>&#9860; Dice</h3>
+            <div class="dice-grid">
+                {% for die in dice_types %}
+                <div class="dice-cell">
+                    <label for="die-{{ die }}">{{ die }}</label>
+                    <input type="number" id="die-{{ die }}" min="0" max="{{ max_dice_per_type }}" value="0">
+                </div>
+                {% endfor %}
+            </div>
+            <button type="button" class="secondary" onclick="addRoll()">Add Roll</button>
+            <div class="pending-rolls" id="pendingRolls"></div>
+        </div>
+
+        <input type="hidden" name="rolls" id="rollsInput" value="[]">
+        <label class="whisper-toggle" id="whisperToggle">
+            <input type="checkbox" name="whisper_dm" value="1" id="whisperDm"{{ ' checked' if draft and draft.to_dm else '' }}>
+            Whisper to the DM
+        </label>
+        <button type="submit" id="postBtn">Post</button>
+    </form>
+
     <div class="card" id="sheetCard">
         <h2 style="color: {{ character.color }};">{{ character.name }}</h2>
         {% if character.class_name %}
@@ -2844,7 +3212,7 @@ BOARD_TEMPLATE = """
         </div>
         <div class="inventory-grid" id="inventoryGrid">
             {% for i in range(slot_count) %}
-                <div class="inv-slot">
+                <div class="inv-slot{{ ' over-slot' if i >= capacity else '' }}"{{ ' hidden' if i >= person_visible else '' }}>
                     <label>{{ i + 1 }}</label>
                     <input type="text" class="inv-input" data-section="person"
                            maxlength="{{ max_item_len }}" value="{{ character.inventory[i] }}"
@@ -2879,38 +3247,9 @@ BOARD_TEMPLATE = """
                 <div>Username <code>{{ character.username }}</code></div>
                 <div>Password <code>{{ character.password }}</code></div>
             </details>
-            <form method="POST" action="{{ url_for('player_logout') }}">
-                <button type="submit" class="secondary">Log Out</button>
-            </form>
         </div>
     </div>
 
-    <form method="POST" action="{{ url_for('new_post') }}" id="postForm">
-        <div class="hint" style="margin-bottom:10px;">Posting as <strong style="color: {{ character.color }};">{{ character.name }}</strong></div>
-        <textarea name="message" placeholder="Speak, wretch..." maxlength="{{ max_len }}" required></textarea>
-        <div class="char-count">Max {{ max_len }} characters &nbsp;&bull;&nbsp; *bold* &nbsp;&bull;&nbsp; "italic dialogue" &nbsp;&bull;&nbsp; type @ to pick a character</div>
-
-        <div class="dice-roller">
-            <h3>&#9860; Dice</h3>
-            <div class="dice-grid">
-                {% for die in dice_types %}
-                <div class="dice-cell">
-                    <label for="die-{{ die }}">{{ die }}</label>
-                    <input type="number" id="die-{{ die }}" min="0" max="{{ max_dice_per_type }}" value="0">
-                </div>
-                {% endfor %}
-            </div>
-            <button type="button" class="secondary" onclick="addRoll()">Add Roll</button>
-            <div class="pending-rolls" id="pendingRolls"></div>
-        </div>
-
-        <input type="hidden" name="rolls" id="rollsInput" value="[]">
-        <label class="whisper-toggle" id="whisperToggle">
-            <input type="checkbox" name="whisper_dm" value="1" id="whisperDm">
-            Whisper to the DM
-        </label>
-        <button type="submit" id="postBtn">Post</button>
-    </form>
 
     </div>
     <div class="layout-right">
@@ -2971,7 +3310,27 @@ BOARD_TEMPLATE = """
                 .map(i => i.value);
         }
 
+        // Show as many 'on your person' slots as the carrying capacity, plus
+        // any further ones that still hold something. New slots appear at
+        // once; an emptied overflow slot only disappears when you leave it,
+        // so it doesn't vanish mid-edit.
+        function updateSlotVisibility(allowShrink) {
+            const slots = Array.from(document.querySelectorAll('#inventoryGrid .inv-slot'));
+            let last = -1;
+            slots.forEach(function (slot, i) { if (slot.querySelector('input').value.trim()) last = i; });
+            const wanted = Math.min(slots.length, Math.max(CAPACITY, last + 1));
+            slots.forEach(function (slot, i) {
+                if (i < wanted) slot.hidden = false;
+                else if (allowShrink && slot.querySelector('input') !== document.activeElement) slot.hidden = true;
+                slot.classList.toggle('over-slot', i >= CAPACITY);
+            });
+        }
+        document.querySelectorAll('#inventoryGrid .inv-input').forEach(function (input) {
+            input.addEventListener('change', function () { updateSlotVisibility(true); });
+        });
+
         function updateEncumbrance() {
+            updateSlotVisibility(false);
             // Container counts — containers have fixed slots, so they can be
             // full but never overloaded.
             document.querySelectorAll('[data-count-for]').forEach(function (el) {
@@ -3125,6 +3484,7 @@ BOARD_TEMPLATE = """
             MAX_CARRY = sheet.capacity * 2;
             document.getElementById('capacityLabel').textContent = sheet.capacity;
             updateEncumbrance();
+            updateSlotVisibility(true);
             renderPendingRolls();
             sheetRevs.abilities = sheet.revs.abilities;
             sheetRevs.conditions = sheet.revs.conditions;
@@ -3153,14 +3513,15 @@ BOARD_TEMPLATE = """
         const rollStats = [
             {% for key, label in ability_pairs %}[{{ key | tojson }}, {{ label | tojson }}, {{ effective[key] | int }}],{% endfor %}
         ];
-        let pendingRolls = [];
+        // A post refused by the once-a-minute limit comes back with its rolls.
+        let pendingRolls = {{ (draft.rolls if draft else []) | tojson }};
 
         function signedNum(n) { return n >= 0 ? '+' + n : String(n); }
 
         function rollStat(roll) {
             return rollStats.find(function (s) { return s[0] === roll.ability; }) || null;
         }
-        let rollCounter = 1;
+        let rollCounter = pendingRolls.length + 1;
 
         function updateRollsInput() {
             document.getElementById('rollsInput').value = JSON.stringify(pendingRolls);
@@ -3275,21 +3636,33 @@ BOARD_TEMPLATE = """
             }
         }
 
-        // --- whisper-to-DM toggle ---
-        (function () {
-            const box = document.getElementById('whisperDm');
-            const form = document.getElementById('postForm');
-            const label = document.getElementById('whisperToggle');
+        // --- post button: whisper toggle + once-a-minute countdown ---
+        const postReadyAt = Date.now() + {{ post_wait }} * 1000;
+        function refreshPostBtn() {
+            const whisper = document.getElementById('whisperDm').checked;
             const btn = document.getElementById('postBtn');
-            box.addEventListener('change', function () {
-                form.classList.toggle('whispering', box.checked);
-                label.classList.toggle('on', box.checked);
-                btn.textContent = box.checked ? 'Whisper to DM' : 'Post';
-                btn.classList.toggle('whisper-btn', box.checked);
-            });
-        })();
+            const left = Math.ceil((postReadyAt - Date.now()) / 1000);
+            const base = whisper ? 'Whisper to DM' : 'Post';
+            btn.disabled = left > 0;
+            btn.textContent = left > 0 ? base + ' (' + left + 's)' : base;
+            btn.title = left > 0 ? 'One post per minute' : '';
+            btn.classList.toggle('whisper-btn', whisper);
+            document.getElementById('postForm').classList.toggle('whispering', whisper);
+            document.getElementById('whisperToggle').classList.toggle('on', whisper);
+        }
+        document.getElementById('whisperDm').addEventListener('change', refreshPostBtn);
+        refreshPostBtn();
+        if (postReadyAt > Date.now()) {
+            const tick = setInterval(function () {
+                refreshPostBtn();
+                if (Date.now() >= postReadyAt) clearInterval(tick);
+            }, 1000);
+        }
+        renderPendingRolls();
+        updateRollsInput();
 
         // --- live feed polling ---
+        const PAGE_EPOCH = {{ state_epoch | tojson }};
         let lastSeq = {{ latest_seq }};
         let lastChange = {{ latest_change }};
         let currentSceneName = {{ scene_name | tojson }};
@@ -3488,6 +3861,7 @@ BOARD_TEMPLATE = """
                                          '&after_change=' + lastChange);
                 if (!resp.ok) return;
                 const data = await resp.json();
+                if (data.epoch && data.epoch !== PAGE_EPOCH) { window.location.reload(); return; }
                 handleSheet(data.sheet);
                 applyFeedChanges(data, buildPostCard);
                 if (typeof data.latest_change === 'number') lastChange = data.latest_change;
@@ -3617,33 +3991,6 @@ DM_DASHBOARD_TEMPLATE = """
     <div class="layout">
     <div class="layout-left">
 
-    <div class="card dm-table-card">
-        <h2>DM Dashboard</h2>
-        <div class="h-under"></div>
-        <p class="hint">
-            {{ characters|length }} character(s) created.
-            <a href="{{ url_for('dm_logout') }}">Log out</a> &nbsp;&bull;&nbsp;
-            <a href="{{ url_for('dm_backup') }}">Download backup</a>
-        </p>
-    </div>
-
-    <div class="card docs-card dm-table-card">
-        <h3>Table Documents</h3>
-        <div class="shelf">
-            {% for adv in adventures %}
-                {% if adv.available %}
-                    <a class="shelf-btn" href="{{ url_for('adventure', slug=adv.slug) }}" target="_blank" rel="noopener noreferrer"
-                       onclick="return popout(this.href, 'adv_{{ adv.slug }}', 1000, 1000);">&#9670; {{ adv.title }}</a>
-                {% else %}
-                    <span class="shelf-btn pending" title="Drop the file into the adventures folder to enable this">
-                        &#9671; {{ adv.title }} &mdash; not added yet</span>
-                {% endif %}
-            {% else %}
-                <span class="hint">No adventures added.</span>
-            {% endfor %}
-        </div>
-    </div>
-
     <div class="card" id="dmPostCard">
         <h3>Post as DM</h3>
         <form method="POST" action="{{ url_for('dm_post') }}" id="dmPostForm" style="background:none; border:none; padding:0;">
@@ -3685,9 +4032,45 @@ DM_DASHBOARD_TEMPLATE = """
         <form method="POST" action="{{ url_for('dm_set_scene') }}" style="background:none; border:none; padding:0;">
             <input type="text" name="scene_name" value="{{ scene_name }}" maxlength="__MAX_SCENE_LENGTH__"
                    placeholder="e.g. The Valley of the Unfortunate Undead" required>
-            <button type="submit" class="secondary">Set Scene</button>
+            <div class="scene-actions">
+                <button type="submit" class="secondary">Set Scene</button>
+                <a class="btn-link" href="{{ url_for('dm_backup') }}">Download Backup</a>
+            </div>
+        </form>
+        <form method="POST" action="{{ url_for('dm_import_backup') }}" enctype="multipart/form-data"
+              class="plain-form import-form"
+              onsubmit="return confirm('Replace the WHOLE game — characters, posts, scene and DM notes — with this backup?\\n\\nThe current game is saved first, so you can undo it with Download previous game.');">
+            <input type="hidden" name="token" value="{{ dm_token }}">
+            <label class="import-label">Import a backup
+                <input type="file" name="backup" accept=".zip,application/zip" required>
+            </label>
+            <div class="scene-actions">
+                <button type="submit" class="secondary">Import Backup</button>
+                {% if previous_backup %}
+                    <a class="btn-link" href="{{ url_for('dm_previous_backup') }}"
+                       title="{{ previous_backup }}">Download previous game</a>
+                {% endif %}
+            </div>
         </form>
     </div>
+
+    <div class="card docs-card dm-table-card">
+        <h3>Table Documents</h3>
+        <div class="shelf">
+            {% for adv in adventures %}
+                {% if adv.available %}
+                    <a class="shelf-btn" href="{{ url_for('adventure', slug=adv.slug) }}" target="_blank" rel="noopener noreferrer"
+                       onclick="return popout(this.href, 'adv_{{ adv.slug }}', 1000, 1000);">&#9670; {{ adv.title }}</a>
+                {% else %}
+                    <span class="shelf-btn pending" title="Drop the file into the adventures folder to enable this">
+                        &#9671; {{ adv.title }} &mdash; not added yet</span>
+                {% endif %}
+            {% else %}
+                <span class="hint">No adventures added.</span>
+            {% endfor %}
+        </div>
+    </div>
+
 
 
     </div>
@@ -3805,7 +4188,7 @@ DM_DASHBOARD_TEMPLATE = """
                     const resp = await fetch('{{ url_for("roll_dice") }}', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ dice: dice })
+                        body: JSON.stringify({ dice: dice, as: 'dm' })
                     });
                     if (!resp.ok) { const err = await resp.json(); alert(err.error || 'Roll failed.'); return; }
                     const data = await resp.json();
@@ -3897,6 +4280,7 @@ DM_DASHBOARD_TEMPLATE = """
         })();
 
         // --- live feed polling ---
+        const PAGE_EPOCH = {{ state_epoch | tojson }};
         let dmLastSeq = {{ latest_seq }};
         let dmLastChange = {{ latest_change }};
         let dmCurrentSceneName = {{ scene_name | tojson }};
@@ -3980,6 +4364,7 @@ DM_DASHBOARD_TEMPLATE = """
                                          '&after_change=' + dmLastChange);
                 if (!resp.ok) return;
                 const data = await resp.json();
+                if (data.epoch && data.epoch !== PAGE_EPOCH) { window.location.reload(); return; }
                 applyFeedChanges(data, dmBuildPostCard);
                 if (typeof data.latest_change === 'number') dmLastChange = data.latest_change;
 
@@ -4307,6 +4692,7 @@ DM_PLAYERS_TEMPLATE = """
         }
 
         const STATE_URL = '{{ url_for("dm_players_state") }}';
+        const PAGE_EPOCH = {{ state_epoch | tojson }};
     {% if character %}
         // --- editor: warn if the player changes this character underneath us ---
         const CHAR_ID = {{ character.id | tojson }};
@@ -4319,6 +4705,7 @@ DM_PLAYERS_TEMPLATE = """
                 const resp = await fetch(STATE_URL);
                 if (!resp.ok) return;
                 const data = await resp.json();
+                if (data.epoch && data.epoch !== PAGE_EPOCH) { window.location.reload(); return; }
                 const row = data.characters.find(c => c.id === CHAR_ID);
                 let text = '';
                 if (!row) {
@@ -4453,6 +4840,7 @@ DM_PLAYERS_TEMPLATE = """
                 const resp = await fetch(STATE_URL);
                 if (!resp.ok) return;
                 const data = await resp.json();
+                if (data.epoch && data.epoch !== PAGE_EPOCH) { window.location.reload(); return; }
                 if (JSON.stringify(data.characters) !== JSON.stringify(roster)) {
                     roster = data.characters;
                     render();
@@ -4709,6 +5097,9 @@ def render_cached(template, **context):
 # ---------------------------------------------------------------------------
 @app.errorhandler(413)
 def request_too_large(e):
+    if request.path == '/dm/import-backup':
+        flash(f'That backup is larger than {IMPORT_MAX_UPLOAD // (1024 * 1024)} MB. Nothing was changed.')
+        return redirect(url_for('dm_home'))
     flash('That request was too large.')
     return redirect(url_for('index'))
 
@@ -4807,6 +5198,9 @@ def index():
         max_item_len=MAX_ITEM_LENGTH,
         posts=[{**p, **dict(zip(('edit_seconds_left', 'can_delete'), own_post_permissions(p, character)))}
                for p in reversed(visible_posts)],
+        draft=take_post_draft('char:' + character['id']),
+        person_visible=person_slots_shown(character),
+        post_wait=post_limiter.wait(character['id']),
         latest_change=_feed_change,
         max_len=MAX_MESSAGE_LENGTH,
         dice_types=list(DICE_TYPES.keys()),
@@ -4840,6 +5234,10 @@ def edit_own_post(post_id):
     if error:
         return error
     character, post, _, _ = found
+    wait = post_edit_limiter.take(character['id'])
+    if wait:
+        too_many('post edits', character['name'], wait)
+        return jsonify({'error': f'Too many changes. Try again in {wait_text(wait)}.'}), 429
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict) or not isinstance(data.get('message'), str):
@@ -4869,6 +5267,10 @@ def delete_own_post(post_id):
     if error:
         return error
     character, post, _, may_delete = found
+    wait = post_edit_limiter.take(character['id'])
+    if wait:
+        too_many('post edits', character['name'], wait)
+        return jsonify({'error': f'Too many changes. Try again in {wait_text(wait)}.'}), 429
     if not may_delete:
         return jsonify({'error': 'Posts with dice rolls can\'t be deleted. You can still edit the text.'}), 403
     # Require the JSON content type, so a cross-site form can't trigger this.
@@ -4880,6 +5282,11 @@ def delete_own_post(post_id):
     record_post_deletion(post_id)
     log_activity(character['name'], 'DELETED_OWN_MESSAGE', f'post_id={post_id}, message="{post["message"]}"')
     return jsonify({'ok': True})
+
+
+@app.context_processor
+def inject_state_epoch():
+    return {'state_epoch': state_epoch}
 
 
 @app.route('/api/mentions')
@@ -4942,7 +5349,8 @@ def api_feed():
         'deleted': deleted,
         'latest_seq': latest_seq,
         'latest_change': _feed_change,
-        'scene_name': scene_name
+        'scene_name': scene_name,
+        'epoch': state_epoch
     }
     # Lets an open board pick up changes the DM made to this character.
     if request.args.get('sheet'):
@@ -5476,6 +5884,20 @@ def roll_dice():
     data = request.get_json(silent=True) or {}
     dice = data.get('dice', {})
 
+    # Whose roll is this? The DM page sends as='dm'; the board rolls for the
+    # logged-in character. Rolls are only ever usable by whoever made them.
+    if data.get('as') == 'dm':
+        if not session.get('is_dm'):
+            return jsonify({'error': 'DM login required.'}), 403
+        owner, who, limiter = 'dm', 'DM', dm_roll_limiter
+    else:
+        character = get_character()
+        if not character:
+            return jsonify({'error': 'Log in to roll.'}), 403
+        if character.get('dead'):
+            return jsonify({'error': 'The dead roll no dice.'}), 403
+        owner, who, limiter = 'char:' + character['id'], character['name'], player_roll_limiter
+
     if not isinstance(dice, dict) or not dice:
         return jsonify({'error': 'No dice specified.'}), 400
 
@@ -5502,7 +5924,20 @@ def roll_dice():
     if not results:
         return jsonify({'error': 'No dice specified.'}), 400
 
-    return jsonify({'results': results, 'total': total, 'description': ' + '.join(description_parts)})
+    # Checked only now, so a malformed request doesn't use up the allowance.
+    wait = limiter.take(owner)
+    if wait:
+        too_many('rolls', who, wait)
+        resp = jsonify({'error': f'Too many rolls. Try again in {wait_text(wait)}.'})
+        resp.headers['Retry-After'] = str(wait)
+        return resp, 429
+
+    # (A refused request's dice were never shown to anyone, so refusing after
+    # rolling gives nothing away.)
+    description = ' + '.join(description_parts)
+    roll_id = store_roll(owner, who, results, total, description)
+    log_activity(who, 'ROLLED', f'{description} = {total}')
+    return jsonify({'roll_id': roll_id, 'results': results, 'total': total, 'description': description})
 
 
 # ---------------------------------------------------------------------------
@@ -5530,8 +5965,21 @@ def new_post():
         flash(f'Message cannot exceed {MAX_MESSAGE_LENGTH} characters.')
         return redirect(url_for('index'))
 
-    clean_rolls = parse_submitted_rolls(rolls_raw, character)
     to_dm = request.form.get('whisper_dm') == '1'
+    owner = 'char:' + character['id']
+
+    wait = post_limiter.take(character['id'])
+    if wait:
+        too_many('posts', character['name'], wait)
+        # Keep what they wrote (and the rolls, which stay waiting server-side)
+        # so the refused post can simply be sent again.
+        save_post_draft(message, rolls_raw, to_dm, owner)
+        flash(f'One post per minute. Your message is still here — post it in {wait_text(wait)}.')
+        return redirect(url_for('index'))
+
+    clean_rolls, dropped = parse_submitted_rolls(rolls_raw, owner, character)
+    if dropped:
+        flash(dropped_rolls_message(dropped))
 
     posts.append({
         'id': str(uuid.uuid4()),
@@ -5576,6 +6024,8 @@ def dm_home():
         notes_for='dm',
         characters=list(characters.values()),
         adventures=list_adventures(),
+        dm_token=dm_form_token(),
+        previous_backup=latest_auto_backup(),
         posts=list(reversed(posts)),
         max_len=MAX_MESSAGE_LENGTH,
         max_item_len=MAX_ITEM_LENGTH,
@@ -5591,17 +6041,29 @@ def dm_home():
 
 @app.route('/dm/login', methods=['POST'])
 def dm_login():
-    password = request.form.get('password', '')
-    if secrets.compare_digest(password, DM_PASSWORD):
+    ip = client_ip()
+    # Failures are limited per address AND in total, since there's only one
+    # DM password to guess and a guesser could spread out over many machines.
+    wait = max(dm_login_ip_limiter.wait(ip), dm_login_total_limiter.wait('all'))
+    if wait:
+        too_many('DM login', 'DM', wait)
+        flash(f'Too many failed DM logins. Try again in {wait_text(wait)}.')
+        return redirect(url_for('dm_home'))
+
+    password = request.form.get('password', '')[:256]
+    # Compare as bytes: compare_digest refuses non-ASCII str.
+    if secrets.compare_digest(password.encode('utf-8'), DM_PASSWORD.encode('utf-8')):
         session['is_dm'] = True
-        log_activity('DM', 'LOGIN_SUCCESS', f'ip={request.remote_addr}')
+        log_activity('DM', 'LOGIN_SUCCESS', f'ip={ip}')
     else:
+        dm_login_ip_limiter.record(ip)
+        dm_login_total_limiter.record('all')
         flash('Incorrect DM password.')
-        log_activity('DM', 'LOGIN_FAILED', f'ip={request.remote_addr}')
+        log_activity('DM', 'LOGIN_FAILED', f'ip={ip}')
     return redirect(url_for('dm_home'))
 
 
-@app.route('/dm/logout')
+@app.route('/dm/logout', methods=['POST'])
 def dm_logout():
     if session.get('is_dm'):
         log_activity('DM', 'LOGOUT')
@@ -5636,7 +6098,9 @@ def dm_post():
     # No length cap for DM posts (players are still capped at MAX_MESSAGE_LENGTH).
     # The global 64KB request-body limit (MAX_CONTENT_LENGTH) still applies.
 
-    clean_rolls = parse_submitted_rolls(rolls_raw, allow_modifier=True)
+    clean_rolls, dropped = parse_submitted_rolls(rolls_raw, 'dm', allow_modifier=True)
+    if dropped:
+        flash(dropped_rolls_message(dropped))
 
     posts.append({
         'id': str(uuid.uuid4()),
@@ -5667,18 +6131,240 @@ def dm_post():
     return redirect(url_for('dm_home'))
 
 
+STATE_FILES = (DATA_FILE, CHAR_FILE, SCENE_FILE, DM_NOTES_FILE)
+AUTO_BACKUP_DIR = os.path.join(DATA_DIR, 'backups')
+
+
+def build_backup_zip():
+    """The same zip the DM downloads: every state file that exists, plus the
+    activity log, each at the top level under its own name."""
+    buf = io.BytesIO()
+    with state_lock, zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for path in STATE_FILES + (LOG_FILE,):
+            if os.path.exists(path):
+                zf.write(path, arcname=os.path.basename(path))
+    return buf.getvalue()
+
+
+def save_auto_backup(reason):
+    """Save the current game into backups/ and keep only the newest few."""
+    os.makedirs(AUTO_BACKUP_DIR, exist_ok=True)
+    name = f'{reason}-{datetime.now().strftime("%Y%m%d-%H%M%S")}.zip'
+    path = os.path.join(AUTO_BACKUP_DIR, name)
+    data = build_backup_zip()
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    olds = sorted(n for n in os.listdir(AUTO_BACKUP_DIR) if n.endswith('.zip'))
+    for old in olds[:-KEEP_AUTO_BACKUPS]:
+        try:
+            os.remove(os.path.join(AUTO_BACKUP_DIR, old))
+        except OSError:
+            pass
+    return name
+
+
+def latest_auto_backup():
+    if not os.path.isdir(AUTO_BACKUP_DIR):
+        return None
+    names = sorted(n for n in os.listdir(AUTO_BACKUP_DIR) if n.endswith('.zip'))
+    return names[-1] if names else None
+
+
+class BackupProblem(ValueError):
+    """An uploaded backup that can't be used; the message is shown to the DM."""
+
+
+def read_backup_zip(data):
+    """Check an uploaded backup completely, before anything is changed.
+    Returns {state file path: parsed JSON} for the state files it contains.
+    Raises BackupProblem with a readable reason otherwise."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise BackupProblem('That file isn\'t a zip. Use a backup made with Download Backup.')
+
+    wanted = {os.path.basename(path): path for path in STATE_FILES}
+    found = {}
+    total = 0
+    with zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            base = os.path.basename(info.filename)  # tolerate a re-zipped folder
+            if base not in wanted:
+                continue  # the activity log and anything else are ignored
+            if wanted[base] in found:
+                raise BackupProblem(f'The backup contains {base} more than once.')
+            total += info.file_size
+            if total > IMPORT_MAX_UNCOMPRESSED:
+                raise BackupProblem('The backup is too large once unpacked.')
+            try:
+                raw = zf.read(info)
+                found[wanted[base]] = json.loads(raw.decode('utf-8'))
+            except (zipfile.BadZipFile, RuntimeError, OSError):
+                raise BackupProblem(f'{base} in the backup is damaged.')
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise BackupProblem(f'{base} in the backup isn\'t valid JSON.')
+
+    if not found:
+        raise BackupProblem('No game files found in that zip. Use a backup made with Download Backup.')
+
+    posts_data = found.get(DATA_FILE, [])
+    if not isinstance(posts_data, list) or not all(isinstance(p, dict) for p in posts_data):
+        raise BackupProblem(f'{os.path.basename(DATA_FILE)} in the backup is not a list of posts.')
+
+    store = found.get(CHAR_FILE, {'characters': {}, 'client_map': {}})
+    if (not isinstance(store, dict) or not isinstance(store.get('characters'), dict)
+            or not isinstance(store.get('client_map', {}), dict)
+            or not all(isinstance(c, dict) for c in store['characters'].values())):
+        raise BackupProblem(f'{os.path.basename(CHAR_FILE)} in the backup is not a character file.')
+    store.setdefault('client_map', {})
+    found[CHAR_FILE] = store
+
+    for path, key in ((SCENE_FILE, 'scene_name'), (DM_NOTES_FILE, 'notes')):
+        if path in found and not (isinstance(found[path], dict) and isinstance(found[path].get(key, ''), str)):
+            raise BackupProblem(f'{os.path.basename(path)} in the backup is not in the expected format.')
+    return found
+
+
+def reload_state_from_disk():
+    """Re-read every state file into memory (running the same upgrades as
+    startup), and forget anything tied to the old game."""
+    global posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change
+    posts = load_posts()
+    characters, client_map = load_character_store()
+    scene_name = load_scene_name()
+    dm_notes = load_dm_notes()
+    _next_post_seq = (max((p.get('seq', -1) for p in posts), default=-1)) + 1
+    _feed_change = max((p.get('change', 0) for p in posts), default=0)
+    _recent_deletions.clear()
+    with _pending_lock:
+        _pending_rolls.clear()
+
+
+def put_back_state(before):
+    global posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change
+    posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change = before
+
+
+def install_game_files(files):
+    """Make the state files on disk exactly the given ones: written
+    atomically, and any state file not in `files` removed (the backup was
+    made before that file existed, so that part of the game was empty)."""
+    for path in STATE_FILES:
+        if path in files:
+            write_json_atomic(path, files[path])
+        elif os.path.exists(path):
+            os.remove(path)
+
+
+def restore_backup_bytes(data):
+    """Put a zip made by build_backup_zip() back on disk, as is."""
+    files = {}
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for path in STATE_FILES:
+            try:
+                files[path] = json.loads(zf.read(os.path.basename(path)).decode('utf-8'))
+            except KeyError:
+                pass
+    install_game_files(files)
+
+
+def dm_form_token():
+    """A per-session secret for the import form, so another website can't
+    submit a backup through a DM's logged-in browser."""
+    if 'dm_form_token' not in session:
+        session['dm_form_token'] = secrets.token_urlsafe(24)
+    return session['dm_form_token']
+
+
+@app.route('/dm/import-backup', methods=['POST'])
+def dm_import_backup():
+    """Replace the whole game with an uploaded backup. Runs outside the
+    request-wide lock (see StateLockMiddleware): the upload is read and
+    checked first, then the lock is taken only for the swap."""
+    global state_epoch
+    if not session.get('is_dm'):
+        flash('DM login required.')
+        return redirect(url_for('dm_home'))
+
+    request.max_content_length = IMPORT_MAX_UPLOAD  # this route only
+    token = request.form.get('token', '')
+    if not secrets.compare_digest(token.encode('utf-8'), session.get('dm_form_token', '').encode('utf-8')) or not token:
+        flash('That import form had expired. Reload the page and try again.')
+        return redirect(url_for('dm_home'))
+
+    upload = request.files.get('backup')
+    if not upload or not upload.filename:
+        flash('Choose a backup file to import.')
+        return redirect(url_for('dm_home'))
+    data = upload.read(IMPORT_MAX_UPLOAD + 1)
+    if len(data) > IMPORT_MAX_UPLOAD:
+        flash(f'That backup is larger than {IMPORT_MAX_UPLOAD // (1024 * 1024)} MB.')
+        return redirect(url_for('dm_home'))
+
+    try:
+        files = read_backup_zip(data)
+    except BackupProblem as problem:
+        log_activity('DM', 'BACKUP_IMPORT_REFUSED', str(problem))
+        flash(f'Nothing was changed. {problem}')
+        return redirect(url_for('dm_home'))
+
+    with state_lock:
+        saved_as = save_auto_backup('before-import')
+        previous = build_backup_zip()
+        # The live game, kept so a failed import can be undone without
+        # re-running any loader (which might be what failed).
+        before = (posts, characters, client_map, scene_name, dm_notes, _next_post_seq, _feed_change)
+        try:
+            install_game_files(files)
+            reload_state_from_disk()
+        except BaseException as exc:  # includes the loaders' SystemExit
+            restore_backup_bytes(previous)
+            put_back_state(before)
+            log_activity('DM', 'BACKUP_IMPORT_FAILED', f'{type(exc).__name__}: {exc}; previous game restored')
+            flash('That backup could not be loaded, so the previous game was put back unchanged.')
+            return redirect(url_for('dm_home'))
+
+        state_epoch = secrets.token_hex(8)
+        save_characters()  # records the new epoch (and any upgrades the loader made)
+
+    log_activity('DM', 'BACKUP_IMPORTED',
+                 f'file="{clean_text(upload.filename, 120)}", characters={len(characters)}, posts={len(posts)}, '
+                 f'previous game saved as backups/{saved_as}')
+    flash(f'Backup imported: {len(characters)} character(s), {len(posts)} post(s). '
+          f'Everyone\'s open pages will reload. The previous game was saved first — '
+          f'use "Download previous game" to get it back.')
+    return redirect(url_for('dm_home'))
+
+
+@app.route('/dm/backup/previous')
+def dm_previous_backup():
+    """Download the game as it was just before the most recent import (or
+    other automatic save), to undo an import by importing this file."""
+    if not session.get('is_dm'):
+        flash('DM login required.')
+        return redirect(url_for('dm_home'))
+    name = latest_auto_backup()
+    if not name:
+        flash('There is no automatic backup yet.')
+        return redirect(url_for('dm_home'))
+    log_activity('DM', 'DOWNLOADED_BACKUP', f'automatic {name}')
+    return send_file(os.path.join(AUTO_BACKUP_DIR, name), mimetype='application/zip',
+                     as_attachment=True, download_name=name)
+
+
 @app.route('/dm/backup')
 def dm_backup():
     if not session.get('is_dm'):
         flash('DM login required.')
         return redirect(url_for('dm_home'))
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for path in (DATA_FILE, CHAR_FILE, SCENE_FILE, DM_NOTES_FILE, LOG_FILE):
-            if os.path.exists(path):
-                zf.write(path, arcname=os.path.basename(path))
-    buf.seek(0)
+    buf = io.BytesIO(build_backup_zip())
 
     log_activity('DM', 'DOWNLOADED_BACKUP')
 
@@ -5781,7 +6467,7 @@ def dm_players_state():
     open editor when the player changes something underneath it."""
     if not session.get('is_dm'):
         return jsonify({'error': 'DM login required.'}), 403
-    return jsonify({'characters': [roster_row(c) for c in characters.values()]})
+    return jsonify({'characters': [roster_row(c) for c in characters.values()], 'epoch': state_epoch})
 
 
 @app.route('/dm/players/quick', methods=['POST'])
@@ -6222,26 +6908,34 @@ def dm_reset_login():
 # ---------------------------------------------------------------------------
 @app.route('/login', methods=['POST'])
 def player_login():
-    ip = request.remote_addr or 'unknown'
-    if login_throttled(ip):
-        flash('Too many failed logins. Wait a few minutes and try again.')
-        return redirect(url_for('index'))
-
+    ip = client_ip()
     username = request.form.get('username', '')[:MAX_LOGIN_FIELD_LENGTH]
     password = request.form.get('password', '')[:MAX_LOGIN_FIELD_LENGTH]
+    user_key = username.strip().lower()
+
+    # Only failures count, per address and per username. The message is the
+    # same either way so it doesn't reveal which usernames exist.
+    wait = max(player_login_ip_limiter.wait(ip), player_login_user_limiter.wait(user_key) if user_key else 0)
+    if wait:
+        too_many('player login', clean_text(username, MAX_LOGIN_FIELD_LENGTH) or '?', wait)
+        flash(f'Too many failed logins. Try again in {wait_text(wait)}.')
+        return redirect(url_for('index'))
+
     character = find_character_by_username(username)
 
     # compare_digest on both branches keeps response timing from revealing
     # whether the username exists.
     expected = character['password'] if character else generate_password()
     if character and secrets.compare_digest(password.encode('utf-8'), expected.encode('utf-8')):
-        _login_failures.pop(ip, None)
+        player_login_user_limiter.reset(user_key)
         log_in_as(character)
         log_activity(character['name'], 'LOGIN_SUCCESS', f'ip={ip}')
         return redirect(url_for('index'))
 
     secrets.compare_digest(password.encode('utf-8'), expected.encode('utf-8'))
-    _login_failures.setdefault(ip, []).append(datetime.now())
+    player_login_ip_limiter.record(ip)
+    if user_key:
+        player_login_user_limiter.record(user_key)
     log_activity(clean_text(username, MAX_LOGIN_FIELD_LENGTH) or '?', 'LOGIN_FAILED', f'ip={ip}')
     flash('Wrong username or password.')
     return redirect(url_for('index'))

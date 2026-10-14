@@ -1,0 +1,23 @@
+# Keep the build context to just app.py and requirements.txt.
+
+# All data (game state, rules, adventures) is bind-mounted at runtime from
+# ./data — see docker-compose.yml — so none of it belongs in the image.
+data/
+
+# Secrets are passed in at runtime via env_file, never baked into the image.
+.env
+.env.example
+
+# Dev leftovers and history
+old_versions/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.claude/
+
+# Docs and compose aren't needed inside the image
+README.md
+docker-compose.yml
+Dockerfile
+.dockerignore

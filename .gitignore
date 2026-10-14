@@ -1,0 +1,11 @@
+# Secrets
+.env
+
+# Game state written by the app (rules and adventures in data/ are kept)
+data/*.json
+data/*.json.*
+data/Activity Log.txt
+data/backups/
+
+__pycache__/
+*.pyc

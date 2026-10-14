@@ -1,0 +1,50 @@
+# MÖRK BORG board. Start with:   docker compose up -d --build
+# Logs:                          docker compose logs -f
+#
+# Before the first start, make sure .env exists next to this file
+# (cp .env.example .env, then fill it in). The app refuses to start without
+# MORKBORG_SECRET_KEY and MORKBORG_DM_PASSWORD.
+
+services:
+  morkborg:
+    build: .
+    image: morkborg-board:latest
+    container_name: morkborg-board
+    restart: unless-stopped
+
+    # host:container — the board is served on http://<this-machine>:999/
+    # The container listens on 5000 internally, because binding a port below
+    # 1024 inside the container would need root. Change only the left number.
+    ports:
+      - "999:5000"
+
+    # Secrets and settings (MORKBORG_SECRET_KEY, MORKBORG_DM_PASSWORD, TZ,
+    # optional MORKBORG_BEHIND_PROXY). Kept out of this file and out of the
+    # image; see .env.example for every option.
+    env_file:
+      - .env
+
+    # Run as the host user who owns ./data, so the app can write there and
+    # the files it creates stay owned by you. PUID/PGID come from .env (find
+    # yours with `id -u` and `id -g`); 1000:1000 if they're not set. No user
+    # account is needed inside the image for this.
+    user: "${PUID:-1000}:${PGID:-1000}"
+
+    volumes:
+      # Everything the app reads or writes: game state, automatic backups,
+      # data/rules and data/adventures. A bind mount, so it's plain files you
+      # can browse, back up and edit on the host. Add or edit an adventure and
+      # just reload the DM page — no rebuild or restart needed. (The rules are
+      # cached, so restart after editing those.)
+      # The target must match MORKBORG_DATA_DIR in the Dockerfile.
+      - ./data:/app/data
+
+    # Without this, container logs grow until the disk is full.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    security_opt:
+      - no-new-privileges:true

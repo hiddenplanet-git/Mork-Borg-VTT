@@ -1014,7 +1014,8 @@ DEFAULT_SCENE_NAME = 'The Dying World'
 MAX_SCENE_LENGTH = 60
 
 # Private notes: one page per character, plus one for the DM. Only the owner
-# can read or write theirs. Character notes are stored on the character;
+# can write theirs; the DM can also read each character's notes (read-only,
+# on that character's page). Character notes are stored on the character;
 # the DM's are a row in the database's meta table.
 MAX_NOTES_LENGTH = 500
 
@@ -1190,6 +1191,44 @@ def activity_log_text():
         rows = _db.execute('SELECT ts, actor, action, details FROM activity_log ORDER BY id').fetchall()
     return ''.join(f'{ts} | {actor} | {action}' + (f' | {details}' if details else '') + '\n'
                    for ts, actor, action, details in rows)
+
+
+ACTIVITY_LOG_PAGE_SIZE = 200
+
+
+def query_activity_log(q='', actor='', action='', page=0):
+    """(matching entry count, one page of entries newest first) for the DM's
+    log viewer. `q` is a plain substring match over actor, action and
+    details; actor and action must match exactly."""
+    where, args = [], []
+    if q:
+        like = '%' + q.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+        where.append("(actor LIKE ? ESCAPE '\\' OR action LIKE ? ESCAPE '\\' OR details LIKE ? ESCAPE '\\')")
+        args += [like] * 3
+    if actor:
+        where.append('actor = ?')
+        args.append(actor)
+    if action:
+        where.append('action = ?')
+        args.append(action)
+    clause = (' WHERE ' + ' AND '.join(where)) if where else ''
+    with state_lock:
+        total = _db.execute(f'SELECT COUNT(*) FROM activity_log{clause}', args).fetchone()[0]
+        rows = _db.execute(f'SELECT ts, actor, action, details FROM activity_log{clause} '
+                           'ORDER BY id DESC LIMIT ? OFFSET ?',
+                           args + [ACTIVITY_LOG_PAGE_SIZE, page * ACTIVITY_LOG_PAGE_SIZE]).fetchall()
+    return total, [{'ts': ts, 'actor': a, 'action': act, 'details': d} for ts, a, act, d in rows]
+
+
+def activity_log_choices():
+    """Distinct actors and actions for the viewer's filter dropdowns. Capped,
+    since failed logins log whatever username was typed."""
+    with state_lock:
+        actors = [r[0] for r in _db.execute(
+            'SELECT DISTINCT actor FROM activity_log ORDER BY actor COLLATE NOCASE LIMIT 300')]
+        actions = [r[0] for r in _db.execute(
+            'SELECT DISTINCT action FROM activity_log ORDER BY action LIMIT 300')]
+    return actors, actions
 
 
 _LOG_LINE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| (.*)$')
@@ -4479,9 +4518,27 @@ DM_DASHBOARD_TEMPLATE = """
                    placeholder="e.g. The Valley of the Unfortunate Undead" required>
             <div class="scene-actions">
                 <button type="submit" class="secondary">Set Scene</button>
-                <a class="btn-link" href="{{ url_for('dm_backup') }}">Download Backup</a>
             </div>
         </form>
+    </div>
+
+    <div class="card dm-table-card">
+        <h3>Records &amp; Backups</h3>
+        <div class="scene-actions">
+            <a class="btn-link" href="{{ url_for('dm_activity_log') }}" target="_blank" rel="noopener noreferrer"
+               onclick="return popout(this.href, 'morkborg_activity_log', 980, 1000);">Activity Log</a>
+        </div>
+        <div class="import-form">
+            <span class="import-label">Backups</span>
+            <p class="hint">A zip of the whole game: characters, posts, scene, DM notes and the activity log.</p>
+            <div class="scene-actions">
+                <a class="btn-link" href="{{ url_for('dm_backup') }}">Download Backup</a>
+                {% if previous_backup %}
+                    <a class="btn-link" href="{{ url_for('dm_previous_backup') }}"
+                       title="Saved automatically before the last import: {{ previous_backup }}">Download previous game</a>
+                {% endif %}
+            </div>
+        </div>
         <form method="POST" action="{{ url_for('dm_import_backup') }}" enctype="multipart/form-data"
               class="plain-form import-form"
               onsubmit="return confirm('Replace the WHOLE game — characters, posts, scene and DM notes — with this backup?\\n\\nThe current game is saved first, so you can undo it with Download previous game.');">
@@ -4491,10 +4548,6 @@ DM_DASHBOARD_TEMPLATE = """
             </label>
             <div class="scene-actions">
                 <button type="submit" class="secondary">Import Backup</button>
-                {% if previous_backup %}
-                    <a class="btn-link" href="{{ url_for('dm_previous_backup') }}"
-                       title="{{ previous_backup }}">Download previous game</a>
-                {% endif %}
             </div>
         </form>
     </div>
@@ -4898,6 +4951,7 @@ DM_PLAYERS_TEMPLATE = """
                                 text-transform: uppercase; letter-spacing: .12em; }
     .stale-notice { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
     .stale-notice button { margin: 0; }
+    .dm-player-notes { min-height: 140px; resize: vertical; line-height: 1.4; cursor: text; }
     @media (max-width: 620px) {
         .roster-row { grid-template-columns: 1fr 1fr; }
         .roster-name, .roster-load { grid-column: 1 / -1; text-align: left; }
@@ -5111,6 +5165,13 @@ DM_PLAYERS_TEMPLATE = """
                 </form>
             </div>
         </div>
+
+        <div class="inv-section-head"><b>Player Notes</b><span>written by the player &mdash; read only here</span></div>
+        {% if character.notes %}
+            <textarea readonly class="dm-player-notes">{{ character.notes }}</textarea>
+        {% else %}
+            <p class="hint">No notes yet.</p>
+        {% endif %}
     </div>
 {% else %}
     <div id="rosterLiving"></div>
@@ -5451,7 +5512,8 @@ NOTES_TEMPLATE = """
     <div class="card notes-card">
         <h2>Notes</h2>
         <div class="h-under"></div>
-        <p class="hint">{{ owner_name }} &mdash; private. Only you can see these notes.</p>
+        <p class="hint">{{ owner_name }} &mdash; private.
+            {% if who == 'dm' %}Only you can see these notes.{% else %}Only you and the DM can see these notes.{% endif %}</p>
         {% if read_only %}
             <p class="hint">This character has died. Their notes can be read but no longer changed.</p>
         {% endif %}
@@ -5524,7 +5586,83 @@ NOTES_TEMPLATE = """
 </html>
 """
 
+ACTIVITY_LOG_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Activity Log</title>
+""" + FAVICON + SHARED_CSS + """
+<style>
+    body { max-width: 980px; }
+    .log-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 6px 0 10px; }
+    .log-head h2 { margin: 0; }
+    .log-head a { color: var(--acid); font-weight: 900; text-transform: uppercase; letter-spacing: .1em; text-decoration: none; }
+    .log-filter { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 12px;
+                  background: none; border: none; padding: 0; }
+    .log-filter input[type=text] { flex: 2 1 200px; margin: 0; }
+    .log-filter select { flex: 1 1 140px; width: auto; margin: 0; }
+    .log-filter button, .log-filter a { margin: 0; }
+    .log-filter a { color: var(--ash); font-size: .85em; text-transform: uppercase; letter-spacing: .1em; }
+    .log-row { display: grid; grid-template-columns: 10.5em minmax(90px, 12em) minmax(120px, 14em) 1fr;
+               gap: 4px 12px; padding: 6px 10px; border-bottom: 1px solid var(--edge); font-size: .92em; }
+    .log-row:nth-child(even) { background: var(--panel); }
+    .log-ts { color: var(--ash); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .log-actor { font-weight: 900; overflow-wrap: anywhere; }
+    .log-action { color: var(--acid); font-weight: 900; letter-spacing: .05em; overflow-wrap: anywhere; }
+    .log-details { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+    .log-pager { display: flex; justify-content: space-between; gap: 10px; margin: 14px 0; }
+    .log-pager a { color: var(--acid); font-weight: 900; text-transform: uppercase; letter-spacing: .1em; text-decoration: none; }
+    @media (max-width: 700px) {
+        .log-row { grid-template-columns: 1fr auto; }
+        .log-ts { grid-column: 1 / -1; }
+        .log-details { grid-column: 1 / -1; }
+    }
+</style>
+</head>
+<body>
+    <div class="log-head">
+        <h2>Activity Log</h2>
+        <a href="{{ url_for('dm_activity_log_text') }}">Download .txt</a>
+    </div>
+    <p class="hint">Every player and DM action, newest first. {{ total }} matching entr{{ 'y' if total == 1 else 'ies' }}.</p>
+
+    <form method="GET" action="{{ url_for('dm_activity_log') }}" class="log-filter">
+        <input type="text" name="q" value="{{ q }}" placeholder="Search actor, action or details" maxlength="100">
+        <select name="actor">
+            <option value="">Anyone</option>
+            {% for a in actors %}<option value="{{ a }}"{{ ' selected' if a == actor else '' }}>{{ a }}</option>{% endfor %}
+        </select>
+        <select name="action">
+            <option value="">Any action</option>
+            {% for a in actions %}<option value="{{ a }}"{{ ' selected' if a == action else '' }}>{{ a }}</option>{% endfor %}
+        </select>
+        <button type="submit" class="secondary">Filter</button>
+        {% if q or actor or action %}<a href="{{ url_for('dm_activity_log') }}">Clear</a>{% endif %}
+    </form>
+
+    {% for e in entries %}
+        <div class="log-row">
+            <span class="log-ts">{{ e.ts }}</span>
+            <span class="log-actor">{{ e.actor }}</span>
+            <span class="log-action">{{ e.action }}</span>
+            <span class="log-details">{{ e.details }}</span>
+        </div>
+    {% else %}
+        <p class="hint">Nothing logged{{ ' matches that filter' if q or actor or action else ' yet' }}.</p>
+    {% endfor %}
+
+    <div class="log-pager">
+        <span>{% if newer_url %}<a href="{{ newer_url }}">&larr; Newer</a>{% endif %}</span>
+        <span>{% if older_url %}<a href="{{ older_url }}">Older &rarr;</a>{% endif %}</span>
+    </div>
+</body>
+</html>
+"""
+
 _NOTES_TPL = app.jinja_env.from_string(NOTES_TEMPLATE)
+_ACTIVITY_LOG_TPL = app.jinja_env.from_string(ACTIVITY_LOG_TEMPLATE)
 _CREATE_TPL = app.jinja_env.from_string(CREATE_TEMPLATE)
 _BOARD_TPL = app.jinja_env.from_string(BOARD_TEMPLATE)
 _DEATH_TPL = app.jinja_env.from_string(DEATH_TEMPLATE)
@@ -6815,6 +6953,48 @@ def dm_backup():
         as_attachment=True,
         download_name=f'morkborg-backup-{timestamp}.zip'
     )
+
+
+@app.route('/dm/activity-log')
+def dm_activity_log():
+    """Browse the activity log, newest first, with search and filters.
+    Viewing isn't itself logged, so paging through doesn't flood the log."""
+    if not session.get('is_dm'):
+        return redirect(url_for('dm_home'))
+    q = clean_text(request.args.get('q', ''), 100)
+    actor = request.args.get('actor', '')[:200]
+    action = request.args.get('action', '')[:200]
+    try:
+        page = max(0, int(request.args.get('page', 0)))
+    except ValueError:
+        page = 0
+    total, entries = query_activity_log(q, actor, action, page)
+    actors, actions = activity_log_choices()
+
+    def page_url(n):
+        return url_for('dm_activity_log', q=q or None, actor=actor or None, action=action or None, page=n or None)
+
+    return render_cached(
+        _ACTIVITY_LOG_TPL,
+        entries=entries,
+        total=total,
+        q=q,
+        actor=actor,
+        action=action,
+        actors=actors,
+        actions=actions,
+        newer_url=page_url(page - 1) if page > 0 else None,
+        older_url=page_url(page + 1) if (page + 1) * ACTIVITY_LOG_PAGE_SIZE < total else None,
+    )
+
+
+@app.route('/dm/activity-log.txt')
+def dm_activity_log_text():
+    if not session.get('is_dm'):
+        return redirect(url_for('dm_home'))
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    return Response(activity_log_text(), mimetype='text/plain; charset=utf-8',
+                    headers={'Content-Disposition': f'attachment; filename="activity-log-{timestamp}.txt"'})
 
 
 @app.route('/dm/set-scene', methods=['POST'])

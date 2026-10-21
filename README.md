@@ -6,8 +6,9 @@ shared feed and roll dice into their posts. The DM gets a password-protected
 dashboard for running the game, plus the rules and adventures in pop-out
 windows.
 
-Everything runs from a single `app.py`. There is no database and no external
-services — all state is plain files in the `data/` folder.
+Everything runs from a single `app.py`, with no external services. All game
+state is stored in one SQLite file in the `data/` folder. SQLite is built into
+Python, so there's no database server to run.
 
 ---
 
@@ -58,13 +59,14 @@ morkapp/
             path-of-the-penitent.html
             rotblack-sludge.html
             two-guillians.html
-        Activity Log.txt, Characters.json, ...  game state (created at runtime)
-        backups/                                 automatic pre-import snapshots
+        morkborg.db (+ -wal, -shm)  game state + activity log (SQLite, created at runtime)
+        backups/                    automatic pre-import snapshots
+        legacy-json/                old JSON files, moved here once imported
 ```
 
 The image holds only code. The `data/` folder is bind-mounted into the
 container at `/app/data`, so game state, rules and adventures all live on the
-host as ordinary files and survive rebuilds.
+host and survive rebuilds.
 
 ---
 
@@ -78,7 +80,7 @@ if either required one is missing — there are no built-in defaults.
 | `MORKBORG_SECRET_KEY` | yes | Signs session cookies. Changing it signs everyone out. |
 | `MORKBORG_DM_PASSWORD` | yes | The shared DM password. |
 | `PUID` / `PGID` | no | Host user/group the container runs as; must own `data/`. Default `1000`. |
-| `TZ` | no | Timezone for Activity Log timestamps (e.g. `America/New_York`). |
+| `TZ` | no | Timezone for activity-log timestamps (e.g. `America/New_York`). |
 | `MORKBORG_BEHIND_PROXY` | no | Set to `1` only behind a reverse proxy, so login limits see real client IPs. |
 | `MORKBORG_DATA_DIR` | no | Where `data/` lives. Defaults to `data/` next to `app.py`; the Dockerfile sets `/app/data`. |
 | `MORKBORG_HOST` / `MORKBORG_PORT` | no | Bind address for a plain `python3 app.py` run only (default `0.0.0.0:5000`). |
@@ -162,21 +164,47 @@ way the container does:
 
 ## Files in data/
 
-Game-state files are created the first time there's something to save, so a
-brand-new install looks half empty until someone makes a character or posts.
+All game state lives in one SQLite database, `data/morkborg.db`, created on
+first start.
 
-| File | Written when | Holds |
-|---|---|---|
-| `Activity Log.txt` | Immediately | Append-only audit trail of every player and DM action |
-| `Characters.json` | First character created | Every character ever made, their logins, and which browser is playing which |
-| `Hidden Message Board.json` | First post | All posts, including whispers |
-| `Scene.json` | DM first sets a scene | The current scene name |
-| `DMNotes.json` | DM first saves notes | The DM's private notes |
-| `backups/` | Before a backup import | Automatic snapshots of the game just replaced |
+| Path | Holds |
+|---|---|
+| `morkborg.db` | Everything: posts (including whispers), characters and their logins, scene name, DM notes, and the activity log |
+| `morkborg.db-wal`, `morkborg.db-shm` | SQLite's working files. They belong to `morkborg.db`; never delete or copy one without the others |
+| `backups/` | Automatic zip snapshots of the game, saved before each backup import |
+| `legacy-json/` | The old JSON files and `Activity Log.txt`, moved here after being imported (see below) |
 
-Back them up with the **Download backup** link on the DM dashboard, or just
-copy `data/`. To wipe the game and start fresh, stop the app and delete the
-state files above — leave `rules/` and `adventures/` in place.
+Inside the database:
+
+| Table | Holds |
+|---|---|
+| `posts` | One row per post. The whole post is JSON in `data`; `seq`, author, whisper target etc. are copied into columns for querying |
+| `characters` | One row per character, likewise: whole sheet in `data`, plus `username`, `name`, `dead` |
+| `activity_log` | Append-only audit trail of every player and DM action (`ts`, `actor`, `action`, `details`) |
+| `meta` | Scene name, DM notes, schema version and the backup-import epoch |
+| `client_map` | Legacy browser links from before logins; empties itself over time |
+
+You can browse it with `sqlite3 data/morkborg.db` or DB Browser for SQLite,
+even while the app is running. Don't edit it while the app is running: the
+app keeps the game in memory and would overwrite your change.
+
+**Backing up.** The **Download backup** link on the DM dashboard gives a zip
+of readable JSON files plus the activity log as text. It's the same format the
+app used before it switched to SQLite, so old and new backups both import.
+Copying `data/` works too, but only while the app is stopped
+(`docker compose stop`). A copy of a live database can miss its newest
+changes.
+
+**Starting fresh.** Stop the app and move `morkborg.db`, `morkborg.db-wal`
+and `morkborg.db-shm` out of `data/`. Leave `rules/` and `adventures/` in
+place.
+
+**Upgrading from the JSON version.** On the first start after upgrading, any
+`Characters.json`, `Hidden Message Board.json`, `Scene.json`, `DMNotes.json`
+and `Activity Log.txt` in `data/` are imported in one go, then moved into
+`data/legacy-json/<date-time>/`. Nothing is deleted. If one of them is
+damaged, the app refuses to start and imports nothing, the same as before.
+Once you're happy the game looks right, you can delete `legacy-json/`.
 
 ---
 
@@ -244,8 +272,9 @@ DM can revive anyone from there.
 - Player sessions last a year, so people stay logged in between sessions.
 - The app's own pages load two fonts from Google Fonts. Without internet the
   layout still works, it just falls back to Impact and Arial Narrow.
-- `Activity Log.txt` only grows. It's small, but if you run the same game for
-  years, rotate it occasionally.
+- The activity log only grows, and a backup import doesn't clear it: it covers
+  every game the board has run. A line is about 100 bytes, so even years of
+  play stay small.
 - MÖRK BORG is copyright Ockult Örtmästare Games and Stockholm Kartell. This
   is a personal tool for your own table, not affiliated with or endorsed by
   them.

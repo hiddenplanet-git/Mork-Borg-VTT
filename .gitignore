@@ -2,10 +2,12 @@
 .env
 
 # Game state written by the app (rules and adventures in data/ are kept)
-data/*.json
-data/*.json.*
-data/Activity Log.txt
+data/morkborg.db*
 data/backups/
+data/legacy-json/
+# Pre-SQLite state files, in case any are still lying around
+data/*.json
+data/Activity Log.txt
 
 __pycache__/
 *.pyc
